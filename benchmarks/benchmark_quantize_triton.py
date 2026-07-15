@@ -5,6 +5,8 @@
 Benchmark script for _quantize Triton implementation in forward_helpers.py.
 
 Compares Triton kernel vs PyTorch ops, both on CUDA (apples to apples).
+
+Based on https://github.com/vllm-project/compressed-tensors/blob/6186e34ac31e93298386568ee0ef6416289a6bda/benchmark_pack_fp4_triton.py
 """
 
 import gc
