@@ -26,7 +26,7 @@ TEST_SIZES = {
 
 FLOAT_TO_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
+device = "cuda:0" if torch.accelerator.is_available() else "cpu"
 
 
 def create_test_data(size, device):
@@ -116,7 +116,7 @@ def benchmark_size(size, name, n_runs=None):
 
 
 def main():
-    if not torch.cuda.is_available():
+    if not torch.accelerator.is_available():
         print("CUDA not available, Triton requires GPU")
         return
 

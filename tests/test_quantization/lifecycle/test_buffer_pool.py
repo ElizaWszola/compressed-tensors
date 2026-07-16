@@ -7,7 +7,7 @@ from compressed_tensors.compressors.nvfp4.helpers import pack_fp4_to_uint8
 from compressed_tensors.quantization.lifecycle.forward_helpers import QuantBufferPool
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not torch.accelerator.is_available(), reason="CUDA not available")
 class TestQuantBufferPoolCUDA:
     """CUDA-specific tests for QuantBufferPool."""
 
