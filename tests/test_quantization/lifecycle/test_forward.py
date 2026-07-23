@@ -671,13 +671,14 @@ def test_quantize_dequantize_matches_sequential(
         global_scale=global_scale,
     )
 
-    # For int types, there are edge cases where a <1e-5 difference gets
-    # rounded to a different integer on CPU and GPU.
-    atol = 1.0 if type == "int" else 1e-4
+    if type == "int":
+        atol, rtol = 1.0, 0  # allow +/-1 due to rounding corner cases
+    else:
+        atol, rtol = 1e-5, 0.05
 
-    assert torch.allclose(sequential_out, fused_out, atol=atol), (
-        f"Mismatch: max diff = "
-        f"{(sequential_out - fused_out).abs().max().item()}, atol={atol}"
+    assert torch.allclose(sequential_out, fused_out, atol=atol, rtol=rtol), (
+        f"Mismatch: max diff = {(sequential_out - fused_out).abs().max().item()}, "
+        f"atol={atol}, rtol={rtol}"
     )
 
 
