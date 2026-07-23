@@ -665,3 +665,73 @@ def test_quantize_dequantize_matches_sequential(
     assert torch.equal(
         sequential_out, fused_out
     ), f"Mismatch: max diff = {(sequential_out - fused_out).abs().max().item()}"
+
+
+@pytest.mark.parametrize(
+    "num_bits,type,symmetric,global_scale",
+    [
+        (8, "int", True, None),
+        (8, "int", False, None),
+        (4, "int", True, None),
+        (4, "float", True, None),  # FP4
+        (8, "float", True, None),
+        (8, "float", True, torch.tensor([2.0])),
+        (8, "int", False, torch.tensor([2.0])),
+    ],
+)
+def test_dequantize_triton_matches_cpu(num_bits, type, symmetric, global_scale):
+    """Verify Triton _dequantize on GPU matches CPU implementation."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    args = QuantizationArgs(
+        num_bits=num_bits,
+        type=type,
+        symmetric=symmetric,
+        strategy=QuantizationStrategy.TENSOR,
+    )
+
+    # Create input on CPU first
+    x_cpu = torch.randn(512, 1024)
+    scale_cpu = torch.rand(1) * 0.01 + 0.001
+    zero_point_cpu = None if symmetric else torch.tensor([3.0])
+    global_scale_cpu = global_scale.clone() if global_scale is not None else None
+
+    q_min_cpu, q_max_cpu = calculate_range(args, torch.device("cpu"))
+
+    # Compute effective scale for quantization
+    effective_scale = scale_cpu
+    if global_scale_cpu is not None:
+        effective_scale = scale_cpu / global_scale_cpu
+
+    # Quantize first to get valid quantized values
+    x_q_cpu = torch.clamp(torch.round(x_cpu / effective_scale), q_min_cpu, q_max_cpu)
+    if zero_point_cpu is not None:
+        x_q_cpu = x_q_cpu + zero_point_cpu
+
+    # Run CPU (non-Triton) path
+    cpu_out = _dequantize(
+        x_q=x_q_cpu,
+        scale=scale_cpu,
+        zero_point=zero_point_cpu,
+        global_scale=global_scale_cpu,
+    )
+
+    # Copy to CUDA and run Triton path
+    x_q_cuda = x_q_cpu.cuda()
+    scale_cuda = scale_cpu.cuda()
+    zero_point_cuda = zero_point_cpu.cuda() if zero_point_cpu is not None else None
+    global_scale_cuda = (
+        global_scale_cpu.cuda() if global_scale_cpu is not None else None
+    )
+
+    cuda_out = _dequantize(
+        x_q=x_q_cuda,
+        scale=scale_cuda,
+        zero_point=zero_point_cuda,
+        global_scale=global_scale_cuda,
+    )
+
+    assert torch.allclose(
+        cpu_out, cuda_out.cpu(), rtol=1e-5, atol=1e-5
+    ), f"Mismatch: max diff = {(cpu_out - cuda_out.cpu()).abs().max().item()}"
