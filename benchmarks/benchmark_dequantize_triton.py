@@ -168,6 +168,8 @@ def run_config(
 
     if strategy == QuantizationStrategy.GROUP:
         config_name = f"{type_str}{num_bits}_g{group_size}"
+    elif strategy == QuantizationStrategy.TENSOR:
+        config_name = f"{type_str}{num_bits}"
     else:
         config_name = f"{type_str}{num_bits}_{strategy_str}"
 
@@ -252,45 +254,54 @@ def main():
 
     results = []
 
-    # Per-tensor (scalar scale) - uses fast scalar kernel path
+    # Per-tensor (scalar scale)
     print("\n" + "=" * 80)
-    print("PER-TENSOR (scalar scale) - uses fast scalar kernel path")
+    print("PER-TENSOR QUANTIZATION (scalar scale)")
     print("=" * 80)
-    for quant_type, num_bits in [(QuantizationType.INT, 8), (QuantizationType.INT, 4)]:
+    for quant_type, num_bits in [
+        (QuantizationType.INT, 8),
+        (QuantizationType.INT, 4),
+        (QuantizationType.FLOAT, 4),
+        (QuantizationType.FLOAT, 8),
+    ]:
         for rows, cols in sizes:
             result = run_config(quant_type, num_bits, rows, cols, QuantizationStrategy.TENSOR)
             results.append(result)
 
-    # Per-channel - uses strided kernel path
+    # Per-channel (one scale per row)
     print("\n" + "=" * 80)
-    print("PER-CHANNEL (one scale per row) - uses strided kernel path")
+    print("PER-CHANNEL QUANTIZATION (one scale per row)")
     print("=" * 80)
-    for quant_type, num_bits in [(QuantizationType.INT, 8), (QuantizationType.INT, 4)]:
+    for quant_type, num_bits in [
+        (QuantizationType.INT, 8),
+        (QuantizationType.INT, 4),
+    ]:
         for rows, cols in sizes:
             result = run_config(quant_type, num_bits, rows, cols, QuantizationStrategy.CHANNEL)
             results.append(result)
 
-    # Per-group - uses strided kernel path
+    # Per-group (multiple scales per row)
     print("\n" + "=" * 80)
-    print("PER-GROUP (multiple scales per row) - uses strided kernel path")
+    print("PER-GROUP QUANTIZATION (group_size=128)")
     print("=" * 80)
-    for quant_type, num_bits, group_size in [
-        (QuantizationType.INT, 8, 128),
-        (QuantizationType.INT, 4, 128),
+    for quant_type, num_bits in [
+        (QuantizationType.INT, 8),
+        (QuantizationType.INT, 4),
     ]:
         for rows, cols in sizes:
-            result = run_config(
-                quant_type, num_bits, rows, cols, QuantizationStrategy.GROUP, group_size
-            )
-            results.append(result)
+            if cols % 128 == 0:  # Only test if divisible by group size
+                result = run_config(
+                    quant_type, num_bits, rows, cols, QuantizationStrategy.GROUP, group_size=128
+                )
+                results.append(result)
 
     # Print summary
     print("\n" + "=" * 100)
     print("SUMMARY")
     print("=" * 100)
     print(
-        f"{'Config':<15} {'Size':<15} {'PyTorch (ms)':<15} "
-        f"{'Triton (ms)':<15} {'Speedup':<10} {'Correct':<8}"
+        f"{'Config':<20} {'Size':<15} {'PyTorch/CUDA (ms)':<18} "
+        f"{'Triton/CUDA (ms)':<18} {'Speedup':<10} {'Correct':<8}"
     )
     print("-" * 100)
 
@@ -298,8 +309,8 @@ def main():
         size_str = f"{r['rows']}x{r['cols']}"
         correct_str = "Yes" if r["correct"] else "NO"
         print(
-            f"{r['config']:<15} {size_str:<15} {r['pytorch_ms']:>11.2f} ms  "
-            f"{r['triton_ms']:>11.2f} ms  "
+            f"{r['config']:<20} {size_str:<15} {r['pytorch_ms']:>14.2f} ms  "
+            f"{r['triton_ms']:>14.2f} ms  "
             f"{r['speedup']:>6.2f}x    {correct_str:<8}"
         )
 
