@@ -12,7 +12,10 @@ Based on benchmark_quantize_triton.py structure.
 import gc
 import torch
 
-from compressed_tensors.quantization.lifecycle.forward_helpers import _dequantize
+from compressed_tensors.quantization.lifecycle.forward_helpers import (
+    _dequantize,
+    _dequantize_triton,
+)
 from compressed_tensors.quantization.quant_args import (
     QuantizationArgs,
     QuantizationType,
@@ -92,9 +95,9 @@ def pytorch_dequantize_cuda(x_q, scale, zero_point, args):
 
 def triton_dequantize_cuda(x_q, scale, zero_point, args):
     """Triton kernel wrapper."""
-    return _dequantize(
-        x_q=x_q,
-        scale=scale,
+    return _dequantize_triton(
+        x_q,
+        scale,
         zero_point=zero_point,
         args=args,
     )
@@ -240,6 +243,12 @@ def run_config(
 def main():
     if not torch.cuda.is_available():
         print("CUDA not available, Triton requires GPU")
+        return
+
+    from compressed_tensors.utils.triton import HAS_TRITON
+
+    if not HAS_TRITON:
+        print("Triton is not available, skipping benchmark")
         return
 
     print("Benchmarking _dequantize from forward_helpers.py")

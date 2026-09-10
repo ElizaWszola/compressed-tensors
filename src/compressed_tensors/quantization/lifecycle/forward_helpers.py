@@ -183,43 +183,19 @@ def _apply_quantize_op(
 ) -> torch.Tensor:
     """Dispatch to the appropriate quantization kernel."""
     if do_quantize and do_dequantize:
-        # Fusion only benefits Triton - use fused path only if Triton is available
-        if _quantize_dequantize_triton_req(
-            x, scale, zero_point, q_min, q_max, args, global_scale
-        ):
-            return _quantize_dequantize_triton(
-                x=x,
-                scale=scale,
-                zero_point=zero_point,
-                q_min=q_min,
-                q_max=q_max,
-                args=args,
-                global_scale=global_scale,
-            )
-        else:
-            # PyTorch fallback: just call quantize then dequantize (no fusion benefit)
-            quantized = _quantize(
-                x=x,
-                scale=scale,
-                zero_point=zero_point,
-                q_min=q_min,
-                q_max=q_max,
-                args=args,
-                dtype=None,  # Keep in float for dequantize
-                global_scale=global_scale,
-            )
-            return _dequantize(
-                x_q=quantized,
-                scale=scale,
-                zero_point=zero_point,
-                dtype=x.dtype,
-                global_scale=global_scale,
-                args=args,
-            )
+        return _quantize_dequantize(
+            x,
+            scale,
+            zero_point=zero_point,
+            q_min=q_min,
+            q_max=q_max,
+            args=args,
+            global_scale=global_scale,
+        )
     elif do_quantize:
         return _quantize(
-            x=x,
-            scale=scale,
+            x,
+            scale,
             zero_point=zero_point,
             q_min=q_min,
             q_max=q_max,
@@ -229,8 +205,8 @@ def _apply_quantize_op(
         )
     else:
         return _dequantize(
-            x_q=x,
-            scale=scale,
+            x,
+            scale,
             zero_point=zero_point,
             global_scale=global_scale,
             args=args,
@@ -342,22 +318,8 @@ def _process_group(
     return output
 
 
-def _quantize_dequantize_triton_req(
-    x: torch.Tensor,
-    scale: torch.Tensor,
-    zero_point: torch.Tensor | None,
-    q_min: torch.Tensor,
-    q_max: torch.Tensor,
-    args: QuantizationArgs,
-    global_scale: torch.Tensor | None = None,
-) -> bool:
-    return triton_req(x) and (
-        not _needs_fp8(x, scale, zero_point, global_scale, args=args)
-        or _is_fp8_supported(x.device)
-    )
-
-
 @torch.no_grad()
+@ImplBackend.register("_quantize_dequantize", triton_req, 0)
 def _quantize_dequantize_triton(
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -475,7 +437,8 @@ def _quantize_dequantize_triton(
     return output.reshape(original_shape)
 
 
-# Alias for tests/backward compatibility
+@torch.no_grad()
+@ImplBackend.entrypoint("_quantize_dequantize")
 def _quantize_dequantize(
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -486,20 +449,25 @@ def _quantize_dequantize(
     global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
-    Helper function for fused quantize-dequantize.
-    This is just a convenience wrapper around _apply_quantize_op.
+    Unfused quantize-dequantize operation.
     """
-    return _apply_quantize_op(
-        x=x,
-        scale=scale,
+    quantized = _quantize(
+        x,
+        scale,
         zero_point=zero_point,
         q_min=q_min,
         q_max=q_max,
         args=args,
-        dtype=None,
-        do_quantize=True,
-        do_dequantize=True,
+        dtype=None,  # Keep in float for dequantize
         global_scale=global_scale,
+    )
+    return _dequantize(
+        quantized,
+        scale,
+        zero_point=zero_point,
+        dtype=x.dtype,
+        global_scale=global_scale,
+        args=args,
     )
 
 
@@ -750,24 +718,8 @@ def adapt_scale_and_zp_for_triton(
     return scale, zero_point
 
 
-def _quantize_triton_req(
-    x: torch.Tensor,
-    scale: torch.Tensor,
-    zero_point: torch.Tensor | None,
-    q_min: torch.Tensor,
-    q_max: torch.Tensor,
-    args: QuantizationArgs,
-    dtype: torch.dtype | None = None,
-    global_scale: torch.Tensor | None = None,
-) -> bool:
-    return triton_req(x) and (
-        not _needs_fp8(x, scale, zero_point, global_scale, args=args)
-        or _is_fp8_supported(x.device)
-    )
-
-
 @torch.no_grad()
-@ImplBackend.register("_quantize", _quantize_triton_req, 0)
+@ImplBackend.register("_quantize", triton_req, 0)
 def _quantize_triton(
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -914,19 +866,10 @@ def _quantize(
     return quantized_ground
 
 
-def _dequantize_triton_req(
-    x_q: torch.Tensor,
-    scale: torch.Tensor,
-    zero_point: torch.Tensor | None = None,
-    dtype: torch.dtype | None = None,
-    global_scale: torch.Tensor | None = None,
-    args: QuantizationArgs | None = None,
-) -> bool:
-    return triton_req(x_q)
-
-
+# Triton dequantization is slower than PyTorch.
+# Disable Triton dequantization by default, but keep it for testing.
 @torch.no_grad()
-@ImplBackend.register("_dequantize", _dequantize_triton_req, 0)
+@ImplBackend.register("_dequantize", triton_req, "disable")
 def _dequantize_triton(
     x_q: torch.Tensor,
     scale: torch.Tensor,

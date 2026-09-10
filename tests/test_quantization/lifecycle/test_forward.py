@@ -13,6 +13,7 @@ from compressed_tensors.quantization.lifecycle.forward import (
 )
 from compressed_tensors.quantization.lifecycle.forward_helpers import (
     _dequantize,
+    _dequantize_triton,
     _is_fp8_supported,
     _quantize,
     _quantize_dequantize,
@@ -28,7 +29,7 @@ from compressed_tensors.quantization.quant_args import (
 from compressed_tensors.quantization.quant_config import QuantizationStatus
 from compressed_tensors.quantization.utils.helpers import calculate_range
 from compressed_tensors.utils.impl_backend import ImplBackend
-from tests.testing_utils import requires_gpu
+from tests.testing_utils import requires_gpu, requires_triton
 from torch.nn import Embedding, Linear
 
 
@@ -654,8 +655,8 @@ def test_quantize_dequantize_matches_sequential(
     zero_point_dequant = zero_point.clone() if zero_point is not None else None
 
     q = _quantize(
-        x=x,
-        scale=scale,
+        x,
+        scale,
         zero_point=zero_point,
         q_min=q_min,
         q_max=q_max,
@@ -663,8 +664,8 @@ def test_quantize_dequantize_matches_sequential(
         global_scale=global_scale,
     )
     sequential_out = _dequantize(
-        x_q=q,
-        scale=scale_ground_dequant,
+        q,
+        scale_ground_dequant,
         zero_point=zero_point_dequant,
         global_scale=global_scale,
         args=args,
@@ -672,8 +673,8 @@ def test_quantize_dequantize_matches_sequential(
 
     # fused
     fused_out = _quantize_dequantize(
-        x=x,
-        scale=scale,
+        x,
+        scale,
         zero_point=zero_point,
         q_min=q_min,
         q_max=q_max,
@@ -699,6 +700,8 @@ def test_quantize_dequantize_matches_sequential(
     )
 
 
+@requires_gpu
+@requires_triton
 @pytest.mark.parametrize(
     "num_bits,type,symmetric,global_scale,strategy,group_size",
     [
@@ -721,14 +724,29 @@ def test_quantize_dequantize_matches_sequential(
         (4, "int", True, None, QuantizationStrategy.GROUP, 64),
         # Per-group with global_scale
         (8, "int", True, torch.tensor([2.0]), QuantizationStrategy.GROUP, 128),
+        (8, "int", False, torch.tensor([2.0]), QuantizationStrategy.GROUP, 128),
+        # Per-group with float types
+        (8, "float", True, None, QuantizationStrategy.GROUP, 128),
+        (8, "float", True, torch.tensor([2.0]), QuantizationStrategy.GROUP, 128),
+        # Tensor-group tests
+        (8, "int", True, None, QuantizationStrategy.TENSOR_GROUP, 128),
+        (8, "int", False, None, QuantizationStrategy.TENSOR_GROUP, 128),
+        (8, "int", True, None, QuantizationStrategy.TENSOR_GROUP, 64),
+        (4, "int", True, None, QuantizationStrategy.TENSOR_GROUP, 128),
+        (4, "int", True, None, QuantizationStrategy.TENSOR_GROUP, 64),
+        (8, "int", True, torch.tensor([2.0]), QuantizationStrategy.TENSOR_GROUP, 128),
+        (8, "int", True, torch.tensor([2.0]), QuantizationStrategy.TENSOR_GROUP, 64),
+        (4, "int", True, torch.tensor([2.0]), QuantizationStrategy.TENSOR_GROUP, 128),
+        (8, "float", True, None, QuantizationStrategy.TENSOR_GROUP, 128),
+        (8, "float", True, torch.tensor([2.0]), QuantizationStrategy.TENSOR_GROUP, 128),
+        (8, "int", False, None, QuantizationStrategy.TENSOR_GROUP, 128),
+        (8, "int", False, torch.tensor([2.0]), QuantizationStrategy.TENSOR_GROUP, 128),
     ],
 )
 def test_dequantize_triton_matches_cpu(
     num_bits, type, symmetric, global_scale, strategy, group_size
 ):
     """Verify Triton _dequantize on GPU matches CPU implementation."""
-    if not torch.accelerator.is_available():
-        pytest.skip("CUDA not available")
 
     args = QuantizationArgs(
         num_bits=num_bits,
@@ -752,7 +770,7 @@ def test_dequantize_triton_matches_cpu(
         zero_point_cpu = (
             None if symmetric else torch.randint(1, 5, (num_rows, 1)).float()
         )
-    elif strategy == QuantizationStrategy.GROUP:
+    elif strategy in (QuantizationStrategy.GROUP, QuantizationStrategy.TENSOR_GROUP):
         # One scale per group: shape (num_rows, num_cols // group_size)
         num_groups = num_cols // group_size
         scale_cpu = torch.rand(num_rows, num_groups) * 0.01 + 0.001
@@ -773,7 +791,7 @@ def test_dequantize_triton_matches_cpu(
 
     # Quantize first to get valid quantized values
     # For group/channel, we need to broadcast scale properly
-    if strategy == QuantizationStrategy.GROUP:
+    if strategy in (QuantizationStrategy.GROUP, QuantizationStrategy.TENSOR_GROUP):
         # Expand scale to match input shape for quantization
         scale_expanded = effective_scale.repeat_interleave(group_size, dim=1)
         x_q_cpu = torch.clamp(torch.round(x_cpu / scale_expanded), q_min_cpu, q_max_cpu)
@@ -795,10 +813,11 @@ def test_dequantize_triton_matches_cpu(
         if zero_point_cpu is not None:
             x_q_cpu = x_q_cpu + zero_point_cpu
 
-    # For GROUP strategy, use broadcasting like real workloads (_process_group):
+    # For GROUP/TENSOR_GROUP strategy, use broadcasting like real workloads
+    # (_process_group):
     # - Reshape x_q to 3D: (num_rows, num_groups, group_size)
     # - Unsqueeze scale to (num_rows, num_groups, 1) for broadcasting
-    if strategy == QuantizationStrategy.GROUP:
+    if strategy in (QuantizationStrategy.GROUP, QuantizationStrategy.TENSOR_GROUP):
         num_groups = num_cols // group_size
         x_q_3d = x_q_cpu.reshape(num_rows, num_groups, group_size)
         # scale.unsqueeze(-1) matches how _process_group prepares scale
@@ -817,17 +836,17 @@ def test_dequantize_triton_matches_cpu(
     else:
         # TENSOR/CHANNEL: CPU fallback in _dequantize handles these correctly
         cpu_out = _dequantize(
-            x_q=x_q_cpu,
-            scale=scale_cpu,
+            x_q_cpu,
+            scale_cpu,
             zero_point=zero_point_cpu,
             global_scale=global_scale_cpu,
             args=args,
         )
 
     # Copy to CUDA and run Triton path
-    # For GROUP strategy, reshape to 3D: (num_rows, num_groups, group_size)
-    # This is what _dequantize_grouped expects for proper group handling
-    if strategy == QuantizationStrategy.GROUP:
+    # For GROUP/TENSOR_GROUP strategy, reshape to 3D: (num_rows, num_groups,
+    # group_size). This is what _dequantize_grouped expects for proper group handling
+    if strategy in (QuantizationStrategy.GROUP, QuantizationStrategy.TENSOR_GROUP):
         x_q_cuda = x_q_3d.cuda()
         scale_cuda = scale_cpu.cuda()  # Shape: (num_rows, num_groups)
         zero_point_cuda = zero_point_cpu.cuda() if zero_point_cpu is not None else None
@@ -840,9 +859,9 @@ def test_dequantize_triton_matches_cpu(
         global_scale_cpu.cuda() if global_scale_cpu is not None else None
     )
 
-    cuda_out = _dequantize(
-        x_q=x_q_cuda,
-        scale=scale_cuda,
+    cuda_out = _dequantize_triton(
+        x_q_cuda,
+        scale_cuda,
         zero_point=zero_point_cuda,
         global_scale=global_scale_cuda,
         args=args,
@@ -933,8 +952,8 @@ def test_quantize_dequantize_triton_matches_cpu(
 
         # CPU path
         cpu_out = _quantize_dequantize(
-            x=x_3d.clone(),
-            scale=scale_3d.clone(),
+            x_3d.clone(),
+            scale_3d.clone(),
             zero_point=zp_3d.clone() if zp_3d is not None else None,
             q_min=q_min_cpu,
             q_max=q_max_cpu,
@@ -946,8 +965,8 @@ def test_quantize_dequantize_triton_matches_cpu(
 
         # CUDA path
         cuda_out = _quantize_dequantize(
-            x=x_3d.cuda(),
-            scale=scale_3d.cuda(),
+            x_3d.cuda(),
+            scale_3d.cuda(),
             zero_point=zp_3d.cuda() if zp_3d is not None else None,
             q_min=q_min_cpu.cuda(),
             q_max=q_max_cpu.cuda(),
@@ -960,8 +979,8 @@ def test_quantize_dequantize_triton_matches_cpu(
         # TENSOR/CHANNEL: shapes work directly
         # CPU path
         cpu_out = _quantize_dequantize(
-            x=x_cpu.clone(),
-            scale=scale_cpu.clone(),
+            x_cpu.clone(),
+            scale_cpu.clone(),
             zero_point=zero_point_cpu.clone() if zero_point_cpu is not None else None,
             q_min=q_min_cpu,
             q_max=q_max_cpu,
@@ -973,8 +992,8 @@ def test_quantize_dequantize_triton_matches_cpu(
 
         # CUDA path
         cuda_out = _quantize_dequantize(
-            x=x_cpu.cuda(),
-            scale=scale_cpu.cuda(),
+            x_cpu.cuda(),
+            scale_cpu.cuda(),
             zero_point=zero_point_cpu.cuda() if zero_point_cpu is not None else None,
             q_min=q_min_cpu.cuda(),
             q_max=q_max_cpu.cuda(),
@@ -1075,8 +1094,8 @@ def test_quantize_triton_matches_cpu(
 
     # Run CPU (non-Triton) path
     cpu_out = _quantize(
-        x=x_cpu,
-        scale=scale_cpu,
+        x_cpu,
+        scale_cpu,
         zero_point=zero_point_cpu,
         q_min=q_min_cpu,
         q_max=q_max_cpu,
@@ -1085,8 +1104,8 @@ def test_quantize_triton_matches_cpu(
     )
 
     accel_out = _quantize(
-        x=x_accel,
-        scale=scale_accel,
+        x_accel,
+        scale_accel,
         zero_point=zero_point_accel,
         q_min=q_min_accel,
         q_max=q_max_accel,
@@ -1198,8 +1217,8 @@ def test_quantize_triton_matches_cpu_non_contiguous(
     assert not x_accel.is_contiguous(), "Accelerator tensor should be non-contiguous"
 
     cpu_out = _quantize(
-        x=x_cpu,
-        scale=scale_cpu,
+        x_cpu,
+        scale_cpu,
         zero_point=zero_point_cpu,
         q_min=q_min_cpu,
         q_max=q_max_cpu,
@@ -1208,8 +1227,8 @@ def test_quantize_triton_matches_cpu_non_contiguous(
     )
 
     accel_out = _quantize(
-        x=x_accel,
-        scale=scale_accel,
+        x_accel,
+        scale_accel,
         zero_point=zero_point_accel,
         q_min=q_min_accel,
         q_max=q_max_accel,
@@ -1283,8 +1302,8 @@ def test_quantize_triton_matches_cpu_block_4d(
     assert x_cuda.stride() == expected_stride, "CUDA tensor stride should match"
 
     cpu_out = _quantize(
-        x=x_cpu,
-        scale=scale_cpu,
+        x_cpu,
+        scale_cpu,
         zero_point=None,
         q_min=q_min_cpu,
         q_max=q_max_cpu,
@@ -1293,8 +1312,8 @@ def test_quantize_triton_matches_cpu_block_4d(
     )
 
     cuda_out = _quantize(
-        x=x_cuda,
-        scale=scale_cuda,
+        x_cuda,
+        scale_cuda,
         zero_point=None,
         q_min=q_min_cuda,
         q_max=q_max_cuda,
