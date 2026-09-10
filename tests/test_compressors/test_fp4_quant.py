@@ -155,8 +155,8 @@ def test_quantize_and_pack_fused(m, n, dtype, symmetric):
 
     # Fused approach: single kernel
     packed_fused = quantize_and_pack_fp4(
-        x=x.clone(),
-        scale=scale,
+        x.clone(),
+        scale,
         global_scale=global_scale,
         zero_point=zero_point,
         group_size=group_size,
@@ -212,8 +212,8 @@ def test_quantize_and_pack_fused_boundary_values():
     packed_separate = pack_fp4_to_uint8(quantized)
 
     packed_fused = quantize_and_pack_fp4(
-        x=x.clone(),
-        scale=scale,
+        x.clone(),
+        scale,
         global_scale=global_scale,
         group_size=group_size,
     )

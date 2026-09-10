@@ -164,36 +164,71 @@ def _quantize_and_pack_fp4_kernel(
     x_low = tl.clamp(x_low, -6.0, 6.0)
     x_high = tl.clamp(x_high, -6.0, 6.0)
 
+    # Round to FP4 values using same logic as _round_to_fp4 in fp4_utils.py
+    # sign is ±32: encodes both the sign and the rescaling factor
+    sign_low = tl.where(x_low < 0.0, -32.0, 32.0)
+    sign_high = tl.where(x_high < 0.0, -32.0, 32.0)
+
+    x_low = tl.abs(x_low)
+    x_high = tl.abs(x_high)
+
+    # Move values from 0 to 0.25 to 0 first to clear space for temporary storage
+    x_low = tl.where(x_low <= 0.25, 0.0, x_low)
+    x_high = tl.where(x_high <= 0.25, 0.0, x_high)
+
+    # Starting with largest bucket, round values to fp4 values divided by 32.
+    # This moves each value temporarily into the 0 to 0.25 range so it won't be
+    # picked up by subsequent threshold checks.
+    x_low = tl.where(x_low > 5.0, 6.0 / 32.0, x_low)
+    x_low = tl.where(x_low >= 3.5, 4.0 / 32.0, x_low)
+    x_low = tl.where(x_low > 2.5, 3.0 / 32.0, x_low)
+    x_low = tl.where(x_low >= 1.75, 2.0 / 32.0, x_low)
+    x_low = tl.where(x_low > 1.25, 1.5 / 32.0, x_low)
+    x_low = tl.where(x_low >= 0.75, 1.0 / 32.0, x_low)
+    x_low = tl.where(x_low > 0.25, 0.5 / 32.0, x_low)
+
+    x_high = tl.where(x_high > 5.0, 6.0 / 32.0, x_high)
+    x_high = tl.where(x_high >= 3.5, 4.0 / 32.0, x_high)
+    x_high = tl.where(x_high > 2.5, 3.0 / 32.0, x_high)
+    x_high = tl.where(x_high >= 1.75, 2.0 / 32.0, x_high)
+    x_high = tl.where(x_high > 1.25, 1.5 / 32.0, x_high)
+    x_high = tl.where(x_high >= 0.75, 1.0 / 32.0, x_high)
+    x_high = tl.where(x_high > 0.25, 0.5 / 32.0, x_high)
+
     # Extract sign bit into bit 3 position (8 = 0b1000)
-    sign_low = tl.where(x_low < 0.0, 8, 0).to(tl.uint8)
-    sign_high = tl.where(x_high < 0.0, 8, 0).to(tl.uint8)
+    # Use the original sign (from sign_low/sign_high) rather than checking fp4 < 0,
+    # because -0.0 < 0.0 is False in IEEE 754, but we need to preserve -0.0's sign
+    sign_bit_low = tl.where(sign_low < 0.0, 8, 0).to(tl.uint8)
+    sign_bit_high = tl.where(sign_high < 0.0, 8, 0).to(tl.uint8)
 
-    abs_low = tl.abs(x_low)
-    abs_high = tl.abs(x_high)
+    # Convert FP4 values to indices: 0→0, 0.5→1, 1→2, 1.5→3, 2→4, 3→5, 4→6, 6→7
+    # Scale abs value by 2 to get integers: 0, 1, 2, 3, 4, 6, 8, 12
+    scaled_low = (x_low * 64.0).to(tl.int8)  # x_low is already abs, * 32 * 2 = 64
+    scaled_high = (x_high * 64.0).to(tl.int8)
 
-    # Use same float thresholds as _round_to_fp4 to compute FP4 index directly
-    # Thresholds: >0.25→1, >=0.75→2, >1.25→3, >=1.75→4, >2.5→5, >=3.5→6, >5.0→7
+    # Map scaled values to indices via threshold counting
     idx_low = (
-        (abs_low > 0.25).to(tl.uint8)
-        + (abs_low >= 0.75).to(tl.uint8)
-        + (abs_low > 1.25).to(tl.uint8)
-        + (abs_low >= 1.75).to(tl.uint8)
-        + (abs_low > 2.5).to(tl.uint8)
-        + (abs_low >= 3.5).to(tl.uint8)
-        + (abs_low > 5.0).to(tl.uint8)
+        (scaled_low >= 1).to(tl.uint8)
+        + (scaled_low >= 2).to(tl.uint8)
+        + (scaled_low >= 3).to(tl.uint8)
+        + (scaled_low >= 4).to(tl.uint8)
+        + (scaled_low >= 6).to(tl.uint8)
+        + (scaled_low >= 8).to(tl.uint8)
+        + (scaled_low >= 12).to(tl.uint8)
     )
-    idx_low = idx_low | sign_low
 
     idx_high = (
-        (abs_high > 0.25).to(tl.uint8)
-        + (abs_high >= 0.75).to(tl.uint8)
-        + (abs_high > 1.25).to(tl.uint8)
-        + (abs_high >= 1.75).to(tl.uint8)
-        + (abs_high > 2.5).to(tl.uint8)
-        + (abs_high >= 3.5).to(tl.uint8)
-        + (abs_high > 5.0).to(tl.uint8)
+        (scaled_high >= 1).to(tl.uint8)
+        + (scaled_high >= 2).to(tl.uint8)
+        + (scaled_high >= 3).to(tl.uint8)
+        + (scaled_high >= 4).to(tl.uint8)
+        + (scaled_high >= 6).to(tl.uint8)
+        + (scaled_high >= 8).to(tl.uint8)
+        + (scaled_high >= 12).to(tl.uint8)
     )
-    idx_high = idx_high | sign_high
+
+    idx_low = idx_low | sign_bit_low
+    idx_high = idx_high | sign_bit_high
 
     # Pack nibbles
     packed = idx_low | (idx_high << 4)
@@ -201,6 +236,54 @@ def _quantize_and_pack_fp4_kernel(
     tl.store(packed_ptr + offsets, packed, mask=mask)
 
 
+@ImplBackend.register("quantize_and_pack_fp4", triton_req, 0)
+def quantize_and_pack_fp4_triton(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    global_scale: torch.Tensor | None = None,
+    zero_point: torch.Tensor | None = None,
+    group_size: int = 16,
+) -> torch.Tensor:
+    """
+    Triton implementation of fused quantization and packing for FP4 (E2M1) format.
+    """
+    m, n = x.shape
+
+    # FP4 packing requires contiguous input since we pack consecutive pairs
+    x_flat = x.contiguous().flatten()
+    n_pairs = x_flat.numel() // 2
+    output_shape = (m, n // 2)
+
+    # Flatten scale for kernel access (must be contiguous)
+    scale_flat = scale.flatten().contiguous()
+
+    # Handle zero_point - pass x_flat as dummy when None
+    zp_flat = zero_point.flatten().contiguous() if zero_point is not None else x_flat
+
+    packed = torch.empty(n_pairs, dtype=torch.uint8, device=x.device)
+
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_pairs, BLOCK_SIZE),)
+
+    # Pass x_flat as dummy for global_scale when None
+    _quantize_and_pack_fp4_kernel[grid](
+        packed,
+        x_flat,
+        scale_flat,
+        zp_flat,
+        global_scale if global_scale is not None else x_flat,
+        m,
+        n,
+        group_size,
+        BLOCK_SIZE,
+        has_zero_point=zero_point is not None,
+        has_global_scale=global_scale is not None,
+    )
+
+    return packed.reshape(output_shape)
+
+
+@ImplBackend.entrypoint("quantize_and_pack_fp4")
 def quantize_and_pack_fp4(
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -231,43 +314,6 @@ def quantize_and_pack_fp4(
         raise ValueError(
             "tensor must have an even number of columns for nvfp4 compression"
         )
-
-    # GPU path using fused Triton kernel
-    if triton_req(x):
-        # FP4 packing requires contiguous input since we pack consecutive pairs
-        x_flat = x.contiguous().flatten()
-        n_pairs = x_flat.numel() // 2
-        output_shape = (m, n // 2)
-
-        # Flatten scale for kernel access (must be contiguous)
-        scale_flat = scale.flatten().contiguous()
-
-        # Handle zero_point - pass x_flat as dummy when None
-        zp_flat = (
-            zero_point.flatten().contiguous() if zero_point is not None else x_flat
-        )
-
-        packed = torch.empty(n_pairs, dtype=torch.uint8, device=x.device)
-
-        BLOCK_SIZE = 1024
-        grid = (triton.cdiv(n_pairs, BLOCK_SIZE),)
-
-        # Pass x_flat as dummy for global_scale when None
-        _quantize_and_pack_fp4_kernel[grid](
-            packed,
-            x_flat,
-            scale_flat,
-            zp_flat,
-            global_scale if global_scale is not None else x_flat,
-            m,
-            n,
-            group_size,
-            BLOCK_SIZE,
-            has_zero_point=zero_point is not None,
-            has_global_scale=global_scale is not None,
-        )
-
-        return packed.reshape(output_shape)
 
     # CPU fallback: use separate quantize + pack
     # Import here to avoid circular dependency

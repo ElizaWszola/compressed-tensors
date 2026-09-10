@@ -78,8 +78,8 @@ def unfused_quantize_pack(x, scale, global_scale, args):
 def fused_quantize_pack(x, scale, global_scale):
     """Fused approach: single kernel launch."""
     return quantize_and_pack_fp4(
-        x=x,
-        scale=scale,
+        x,
+        scale,
         global_scale=global_scale,
         zero_point=None,
         group_size=GROUP_SIZE,
