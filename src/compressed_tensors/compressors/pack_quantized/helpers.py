@@ -24,26 +24,12 @@ __all__ = [
 
 
 # =============================================================================
-# Triton kernel for the core bit-packing operation
-# =============================================================================
-#
-# The scatter_add-based packing in PyTorch has overhead. A Triton kernel can
-# directly compute output words by looping over input elements, avoiding scatter.
-#
-# Input:  value_g of shape (rows_g, 32) - groups of 32 input elements
-# Output: output_g of shape (rows_g, num_bits) - packed int32 words per group
-#
-# For each group of 32 elements, element i contributes to output words based on:
-#   bit_start = i * num_bits
-#   word_idx = bit_start // 32
-#   bit_offset = bit_start % 32
-#
-# If bit_offset + num_bits > 32, the element overflows into word_idx + 1.
+# Triton kernels for bit-packing operations
 # =============================================================================
 
 
 @triton.jit
-def _pack_to_int32_kernel(
+def _pack_to_int32_row_parallel_kernel(
     input_ptr,
     output_ptr,
     rows_g,
@@ -53,24 +39,15 @@ def _pack_to_int32_kernel(
     """
     Triton kernel for packing 32-element groups into num_bits int32 words.
 
-    Each program instance processes one group (row of 32 elements).
+    Parallelizes over row groups (each row is a 32-element group).
+    Each program instance processes BLOCK_SIZE groups.
     """
     pid = tl.program_id(0)
     row_start = pid * BLOCK_SIZE
     row_offsets = row_start + tl.arange(0, BLOCK_SIZE)
     row_mask = row_offsets < rows_g
 
-    # Load 32 input elements for each row in this block
-    # Input layout: (rows_g, 32), contiguous
-    # We process BLOCK_SIZE rows, each with 32 elements
-
-    # Initialize output accumulators for num_bits words per row
-    # We'll compute each output word by iterating over input elements
-
-    # For num_bits in [1,8], max output words is 8, hence 8 accumulators
-    # We'll compute word by word
-
-    # Output word 0
+    # 8 accumulators for up to 8 output words (num_bits in [1,8])
     out0 = tl.zeros((BLOCK_SIZE,), dtype=tl.int32)
     out1 = tl.zeros((BLOCK_SIZE,), dtype=tl.int32)
     out2 = tl.zeros((BLOCK_SIZE,), dtype=tl.int32)
@@ -80,32 +57,22 @@ def _pack_to_int32_kernel(
     out6 = tl.zeros((BLOCK_SIZE,), dtype=tl.int32)
     out7 = tl.zeros((BLOCK_SIZE,), dtype=tl.int32)
 
-    # Process each of the 32 input elements
     for elem_i in range(32):
-        # Load input value for this element across all rows in block
         input_offset = row_offsets * 32 + elem_i
         val = tl.load(input_ptr + input_offset, mask=row_mask, other=0)
 
-        # Compute bit position
         bit_start = elem_i * num_bits
         word_idx = bit_start // 32
         bit_offset = bit_start % 32
 
-        # Shift value to its position within the word
         shifted_lo = val << bit_offset
-
-        # Check for overflow into next word
         overflow_bits = bit_offset + num_bits - 32
         has_overflow = overflow_bits > 0
 
         # High bits that overflow to next word (right-shifted)
         shifted_hi = tl.where(has_overflow, val >> (num_bits - overflow_bits), 0)
 
-        # Accumulate into the appropriate output word(s)
-        # For num_bits in [1,8], word_idx is in [0, 7] and word_idx+1 in [0, 8]
-        # We use explicit conditionals since word_idx is known at compile time
-        # for each elem_i
-
+        # Accumulate into output word (word_idx is compile-time constant per elem_i)
         out0 = tl.where(word_idx == 0, out0 | shifted_lo, out0)
         out1 = tl.where(word_idx == 1, out1 | shifted_lo, out1)
         out2 = tl.where(word_idx == 2, out2 | shifted_lo, out2)
@@ -115,7 +82,9 @@ def _pack_to_int32_kernel(
         out6 = tl.where(word_idx == 6, out6 | shifted_lo, out6)
         out7 = tl.where(word_idx == 7, out7 | shifted_lo, out7)
 
-        # Handle overflow to next word
+        # Handle overflow to next word (elements spanning word boundaries)
+        # next_word == 8 would overflow output bounds, but doesn't happen
+        # for valid num_bits in [1,8] with 32 elements
         if has_overflow:
             next_word = word_idx + 1
             out1 = tl.where(next_word == 1, out1 | shifted_hi, out1)
@@ -125,11 +94,8 @@ def _pack_to_int32_kernel(
             out5 = tl.where(next_word == 5, out5 | shifted_hi, out5)
             out6 = tl.where(next_word == 6, out6 | shifted_hi, out6)
             out7 = tl.where(next_word == 7, out7 | shifted_hi, out7)
-            # next_word == 8 would overflow output bounds, but doesn't happen
-            # for valid num_bits in [1,8] with 32 elements
 
     # Store output words
-    # Output layout: (rows_g, num_bits), contiguous
     if num_bits >= 1:
         tl.store(output_ptr + row_offsets * num_bits + 0, out0, mask=row_mask)
     if num_bits >= 2:
@@ -148,7 +114,7 @@ def _pack_to_int32_kernel(
         tl.store(output_ptr + row_offsets * num_bits + 7, out7, mask=row_mask)
 
 
-def _pack_groups_triton(value_g: torch.Tensor, num_bits: int) -> torch.Tensor:
+def _pack_row_parallel_triton(value_g: torch.Tensor, num_bits: int) -> torch.Tensor:
     """
     Triton implementation of the core bit-packing operation.
 
@@ -164,7 +130,7 @@ def _pack_groups_triton(value_g: torch.Tensor, num_bits: int) -> torch.Tensor:
     BLOCK_SIZE = 256
     grid = (triton.cdiv(rows_g, BLOCK_SIZE),)
 
-    _pack_to_int32_kernel[grid](
+    _pack_to_int32_row_parallel_kernel[grid](
         value_g,
         output_g,
         rows_g,
@@ -175,19 +141,21 @@ def _pack_groups_triton(value_g: torch.Tensor, num_bits: int) -> torch.Tensor:
     return output_g
 
 
-def _pack_groups_triton_req(value_g: torch.Tensor, num_bits: int) -> bool:
-    """Check if Triton implementation can be used for group packing."""
+def _pack_row_parallel_triton_req(value_g: torch.Tensor, num_bits: int) -> bool:
+    """Check if Triton implementation can be used."""
     return triton_req(value_g)
 
 
-@ImplBackend.register("_pack_groups", _pack_groups_triton_req, 0)
-def _pack_groups_triton_impl(value_g: torch.Tensor, num_bits: int) -> torch.Tensor:
+@ImplBackend.register("_pack_row_parallel", _pack_row_parallel_triton_req, 0)
+def _pack_row_parallel_triton_impl(
+    value_g: torch.Tensor, num_bits: int
+) -> torch.Tensor:
     """ImplBackend-registered Triton implementation."""
-    return _pack_groups_triton(value_g, num_bits)
+    return _pack_row_parallel_triton(value_g, num_bits)
 
 
-@ImplBackend.entrypoint("_pack_groups")
-def _pack_groups(value_g: torch.Tensor, num_bits: int) -> torch.Tensor:
+@ImplBackend.entrypoint("_pack_row_parallel")
+def _pack_row_parallel(value_g: torch.Tensor, num_bits: int) -> torch.Tensor:
     """
     Pack groups of 32 elements into num_bits int32 words.
 
@@ -227,7 +195,7 @@ def _pack_groups(value_g: torch.Tensor, num_bits: int) -> torch.Tensor:
 
 
 @triton.jit
-def _pack_to_int32_dim0_kernel(
+def _pack_to_int32_col_parallel_kernel(
     input_ptr,
     output_ptr,
     rows,
@@ -242,24 +210,17 @@ def _pack_to_int32_dim0_kernel(
     """
     Triton kernel for packing along dim 0 without transpose.
 
-    Packs elements along rows (dim 0) for each column independently.
-    Input: (rows, cols), pack along dim 0
-    Output: (packed_rows, cols)
-
-    For each column c, reads input[0:rows, c] and packs into output[0:packed_rows, c].
+    Parallelizes over columns. For each column, packs groups of 32 rows
+    into num_bits output words.
     """
     pid = tl.program_id(0)
-
-    # Each program handles one column (or a small group)
     col_start = pid * BLOCK_SIZE_COL
     col_offsets = col_start + tl.arange(0, BLOCK_SIZE_COL)
     col_mask = col_offsets < cols
 
-    # Process groups of 32 rows for this column
     num_groups = padded_rows // 32
 
     for group_idx in range(num_groups):
-        # Initialize output accumulators for this group
         out0 = tl.zeros((BLOCK_SIZE_COL,), dtype=tl.int32)
         out1 = tl.zeros((BLOCK_SIZE_COL,), dtype=tl.int32)
         out2 = tl.zeros((BLOCK_SIZE_COL,), dtype=tl.int32)
@@ -271,30 +232,21 @@ def _pack_to_int32_dim0_kernel(
 
         row_base = group_idx * 32
 
-        # Process each of the 32 input rows in this group
         for elem_i in range(32):
             row = row_base + elem_i
-
-            # Load input value: input[row, col] with row-major layout
-            # input_ptr + row * input_row_stride + col
             input_offset = row * input_row_stride + col_offsets
             row_valid = row < rows
             val = tl.load(input_ptr + input_offset, mask=col_mask & row_valid, other=0)
 
-            # Compute bit position (same logic as before)
             bit_start = elem_i * num_bits
             word_idx = bit_start // 32
             bit_offset = bit_start % 32
 
-            # Shift value to its position within the word
             shifted_lo = val << bit_offset
-
-            # Check for overflow into next word
             overflow_bits = bit_offset + num_bits - 32
             has_overflow = overflow_bits > 0
             shifted_hi = tl.where(has_overflow, val >> (num_bits - overflow_bits), 0)
 
-            # Accumulate into appropriate output word
             out0 = tl.where(word_idx == 0, out0 | shifted_lo, out0)
             out1 = tl.where(word_idx == 1, out1 | shifted_lo, out1)
             out2 = tl.where(word_idx == 2, out2 | shifted_lo, out2)
@@ -315,8 +267,6 @@ def _pack_to_int32_dim0_kernel(
                 out7 = tl.where(next_word == 7, out7 | shifted_hi, out7)
 
         # Store output words for this group
-        # Output layout: (packed_rows, cols), row-major
-        # output[out_row, col] = output_ptr + out_row * output_row_stride + col
         out_row_base = group_idx * num_bits
 
         if num_bits >= 1:
@@ -385,7 +335,7 @@ def _pack_to_int32_dim0_kernel(
             )
 
 
-def _pack_dim0_triton(
+def _pack_col_parallel_triton(
     value: torch.Tensor,
     num_bits: int,
 ) -> torch.Tensor:
@@ -405,7 +355,7 @@ def _pack_dim0_triton(
     BLOCK_SIZE_COL = 32
     grid = (triton.cdiv(cols, BLOCK_SIZE_COL),)
 
-    _pack_to_int32_dim0_kernel[grid](
+    _pack_to_int32_col_parallel_kernel[grid](
         value,
         output,
         rows,
@@ -421,52 +371,58 @@ def _pack_dim0_triton(
     return output
 
 
-def _pack_dim0_triton_req(value: torch.Tensor, num_bits: int) -> bool:
-    """Check if Triton implementation can be used for dim0 packing."""
+def _pack_col_parallel_triton_req(value: torch.Tensor, num_bits: int) -> bool:
+    """Check if Triton implementation can be used."""
     return triton_req(value)
 
 
-@ImplBackend.register("_pack_dim0", _pack_dim0_triton_req, 0)
-def _pack_dim0_triton_impl(value: torch.Tensor, num_bits: int) -> torch.Tensor:
-    """ImplBackend-registered Triton implementation for dim0 packing."""
-    return _pack_dim0_triton(value.contiguous(), num_bits)
+@ImplBackend.register("_pack_col_parallel", _pack_col_parallel_triton_req, 0)
+def _pack_col_parallel_triton_impl(value: torch.Tensor, num_bits: int) -> torch.Tensor:
+    """ImplBackend-registered Triton implementation."""
+    return _pack_col_parallel_triton(value.contiguous(), num_bits)
 
 
-@ImplBackend.entrypoint("_pack_dim0")
-def _pack_dim0(value: torch.Tensor, num_bits: int) -> torch.Tensor:
+def _pack_grouped(value: torch.Tensor, num_bits: int) -> torch.Tensor:
+    """
+    Pack columns using row-parallel grouped packing.
+
+    Pads input to multiple of 32, reshapes into 32-element groups,
+    calls _pack_row_parallel, then reshapes back.
+
+    :param value: Input tensor of shape (rows, cols), dtype int32, unsigned values
+    :param num_bits: Number of bits per element (1-8)
+    :return: Packed tensor of shape (rows, packed_cols), dtype int32
+    """
+    rows, cols = value.shape
+    packed_cols = math.ceil(cols * num_bits / 32)
+
+    padded_cols = math.ceil(cols / 32) * 32
+    if padded_cols > cols:
+        value = torch.nn.functional.pad(value, (0, padded_cols - cols))
+
+    num_groups = padded_cols // 32
+    rows_g = rows * num_groups
+    value_g = value.reshape(rows_g, 32).contiguous()
+
+    output_g = _pack_row_parallel(value_g, num_bits)
+
+    return output_g.view(rows, num_groups * num_bits)[:, :packed_cols]
+
+
+@ImplBackend.entrypoint("_pack_col_parallel")
+def _pack_col_parallel(value: torch.Tensor, num_bits: int) -> torch.Tensor:
     """
     Pack along dim 0 with automatic backend dispatch.
 
-    Uses no-transpose Triton kernel on CUDA/XPU, falls back to
-    transpose + grouped packing on CPU.
+    Uses col-parallel Triton kernel on CUDA/XPU, falls back to
+    transpose + row-parallel grouped packing on CPU.
 
     :param value: Input tensor of shape (rows, cols), dtype int32, unsigned values
     :param num_bits: Number of bits per element (1-8)
     :return: Packed tensor of shape (packed_rows, cols), dtype int32
     """
-    # PyTorch fallback: transpose + grouped packing
-    rows, cols = value.shape
-    packed_rows = math.ceil(rows * num_bits / 32)
-
-    # Transpose to pack along what becomes dim 1
-    value_t = value.transpose(0, 1)
-    # Now shape is (cols, rows), pack along dim 1 (the rows)
-
-    padded_rows = math.ceil(rows / 32) * 32
-    if padded_rows > rows:
-        value_t = torch.nn.functional.pad(value_t, (0, padded_rows - rows))
-
-    num_groups = padded_rows // 32
-    rows_g = cols * num_groups
-    value_g = value_t.reshape(rows_g, 32).contiguous()
-
-    output_g = _pack_groups(value_g, num_bits)
-
-    # Reshape and transpose back
-    output_t = output_g.view(cols, num_groups * num_bits)[:, :packed_rows]
-    output = output_t.transpose(0, 1)
-
-    return output
+    # PyTorch fallback: transpose, grouped pack, transpose back
+    return _pack_grouped(value.transpose(0, 1), num_bits).transpose(0, 1)
 
 
 def pack_to_int32_accelerated(
@@ -485,8 +441,8 @@ def pack_to_int32_accelerated(
     Uses Triton kernel for the core bit-packing operation on CUDA/XPU devices,
     falls back to PyTorch scatter_add on CPU.
 
-    For packed_dim=0, uses a specialized no-transpose Triton kernel that avoids
-    transpose overhead by reading/writing directly in the native memory layout.
+    For packed_dim=0, uses the col-parallel Triton kernel (no transpose).
+    For packed_dim=1, uses the row-parallel Triton kernel (grouped packing).
 
     :param value: tensor to pack (must be torch.int8)
     :param num_bits: number of bits per element, must be in [1, 8]
@@ -510,36 +466,14 @@ def pack_to_int32_accelerated(
             ]
         )
 
-    # Convert to unsigned range for packing, matching quantization offset
+    # Convert to unsigned range for packing
     offset = 1 << (num_bits - 1)
     value = value.to(torch.int32) + offset
 
-    # For packed_dim=0, use ImplBackend dispatch
-    # (Triton no-transpose or PyTorch fallback)
     if packed_dim == 0:
-        return _pack_dim0(value, num_bits)
+        return _pack_col_parallel(value, num_bits)
 
-    # For packed_dim=1: use grouped packing with ImplBackend dispatch
-    rows, cols = value.shape
-    packed_cols = math.ceil(cols * num_bits / 32)
-
-    # Pad to a multiple of 32 so we can reshape into groups
-    padded_cols = math.ceil(cols / 32) * 32
-    if padded_cols > cols:
-        value = torch.nn.functional.pad(value, (0, padded_cols - cols))
-
-    num_groups = padded_cols // 32
-    rows_g = rows * num_groups
-    value_g = value.reshape(rows_g, 32).contiguous()
-
-    # Use ImplBackend dispatch for the core packing operation
-    # This will use Triton on CUDA/XPU, PyTorch scatter_add on CPU
-    output_g = _pack_groups(value_g, num_bits)
-
-    # Truncate to minimum number of int32 words needed
-    output = output_g.view(rows, num_groups * num_bits)[:, :packed_cols]
-
-    return output
+    return _pack_grouped(value, num_bits)
 
 
 def pack_to_int32(
@@ -575,7 +509,7 @@ def pack_to_int32(
             ]
         )
 
-    # Convert to unsigned range for packing, matching quantization offset
+    # Convert to unsigned range for packing
     offset = 1 << (num_bits - 1)
     value = value.to(torch.int32) + offset
     device = value.device
@@ -586,7 +520,6 @@ def pack_to_int32(
     rows, cols = value.shape
     packed_cols = math.ceil(cols * num_bits / 32)
 
-    # Pad to a multiple of 32 so we can reshape into groups
     padded_cols = math.ceil(cols / 32) * 32
     if padded_cols > cols:
         value = torch.nn.functional.pad(value, (0, padded_cols - cols))
@@ -617,7 +550,6 @@ def pack_to_int32(
             ov_vals,
         )
 
-    # Truncate to minimum number of int32 words needed
     output = output_g.view(rows, num_groups * num_bits)[:, :packed_cols]
 
     if packed_dim == 0:
@@ -668,7 +600,6 @@ def unpack_from_int32(
     rows, num_words = value.shape
     cols = int(shape[packed_dim])
 
-    # Pad to a multiple of num_bits words so we can reshape into groups
     if num_words % num_bits != 0:
         pad_words = num_bits - (num_words % num_bits)
         value = torch.nn.functional.pad(value, (0, pad_words))
@@ -695,7 +626,6 @@ def unpack_from_int32(
     ) << lo_bits[ov_mask].unsqueeze(0)
     output_g[:, ov_mask] |= right
 
-    # unpad to original cols and reshape
     output = output_g.view(rows, num_groups * 32)[:, :cols]
 
     if packed_dim == 0:
