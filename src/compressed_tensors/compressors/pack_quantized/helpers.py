@@ -509,7 +509,7 @@ def pack_to_int32(
             ]
         )
 
-    # Convert to unsigned range for packing
+    # Convert to unsigned range for packing, matching quantization offset
     offset = 1 << (num_bits - 1)
     value = value.to(torch.int32) + offset
     device = value.device
@@ -520,6 +520,7 @@ def pack_to_int32(
     rows, cols = value.shape
     packed_cols = math.ceil(cols * num_bits / 32)
 
+    # Pad to a multiple of 32 so we can reshape into groups
     padded_cols = math.ceil(cols / 32) * 32
     if padded_cols > cols:
         value = torch.nn.functional.pad(value, (0, padded_cols - cols))
@@ -550,6 +551,7 @@ def pack_to_int32(
             ov_vals,
         )
 
+    # Truncate to minimum number of int32 words needed
     output = output_g.view(rows, num_groups * num_bits)[:, :packed_cols]
 
     if packed_dim == 0:
@@ -600,6 +602,7 @@ def unpack_from_int32(
     rows, num_words = value.shape
     cols = int(shape[packed_dim])
 
+    # Pad to a multiple of num_bits words so we can reshape into groups
     if num_words % num_bits != 0:
         pad_words = num_bits - (num_words % num_bits)
         value = torch.nn.functional.pad(value, (0, pad_words))
@@ -626,6 +629,7 @@ def unpack_from_int32(
     ) << lo_bits[ov_mask].unsqueeze(0)
     output_g[:, ov_mask] |= right
 
+    # Unpad to original cols and reshape
     output = output_g.view(rows, num_groups * 32)[:, :cols]
 
     if packed_dim == 0:
