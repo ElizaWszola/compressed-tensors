@@ -18,7 +18,6 @@ from compressed_tensors.utils.triton import tl, triton, triton_req
 
 __all__ = [
     "pack_to_int32",
-    "pack_to_int32_accelerated",
     "unpack_from_int32",
 ]
 
@@ -425,14 +424,12 @@ def _pack_col_parallel(value: torch.Tensor, num_bits: int) -> torch.Tensor:
     return _pack_grouped(value.transpose(0, 1), num_bits).transpose(0, 1)
 
 
-def pack_to_int32_accelerated(
+def pack_to_int32(
     value: torch.Tensor,
     num_bits: int,
     packed_dim: Literal[0, 1] = 1,
 ) -> torch.Tensor:
     """
-    Accelerated version of pack_to_int32 using Triton when available.
-
     Packs a tensor of intB (B=num_bits) quantized weights (stored in int8) into int32s.
     This packing is dense, with no padding bits, where necessary elements are split
     across int32 boundaries. For E elements of intB, we need E*B total bits, which means
@@ -461,7 +458,7 @@ def pack_to_int32_accelerated(
     if value.ndim > 2:
         return torch.stack(
             [
-                pack_to_int32_accelerated(value[i], num_bits, packed_dim)
+                pack_to_int32(value[i], num_bits, packed_dim)
                 for i in range(value.shape[0])
             ]
         )
@@ -474,90 +471,6 @@ def pack_to_int32_accelerated(
         return _pack_col_parallel(value, num_bits)
 
     return _pack_grouped(value, num_bits)
-
-
-def pack_to_int32(
-    value: torch.Tensor,
-    num_bits: int,
-    packed_dim: Literal[0, 1] = 1,
-) -> torch.Tensor:
-    """
-    Packs a tensor of intB (B=num_bits) quantized weights (stored in int8) into int32s.
-    This packing is dense, with no padding bits, where necessary elements are split
-    across int32 boundaries. For E elements of intB, we need E*B total bits, which means
-    ceil(E*B/32) int32s when packed.
-
-    :param value: tensor to pack (must be torch.int8)
-    :param num_bits: number of bits per element, must be in [1, 8]
-    :param packed_dim: dimension to pack along (0 or 1)
-    :returns: packed int32 tensor
-    """
-    if value.dtype is not torch.int8:
-        raise ValueError("Tensor must be quantized to torch.int8 before packing")
-
-    if not 1 <= num_bits <= 8:
-        raise ValueError(
-            f"Packing is only supported for num_bits in [1, 8], got {num_bits}"
-        )
-
-    # Handle N-dimensional tensors (e.g. MoE 3D weights) by packing each 2D slice
-    if value.ndim > 2:
-        return torch.stack(
-            [
-                pack_to_int32(value[i], num_bits, packed_dim)
-                for i in range(value.shape[0])
-            ]
-        )
-
-    # Convert to unsigned range for packing, matching quantization offset
-    offset = 1 << (num_bits - 1)
-    value = value.to(torch.int32) + offset
-    device = value.device
-
-    if packed_dim == 0:
-        value = value.transpose(0, 1)
-
-    rows, cols = value.shape
-    packed_cols = math.ceil(cols * num_bits / 32)
-
-    # Pad to a multiple of 32 so we can reshape into groups
-    padded_cols = math.ceil(cols / 32) * 32
-    if padded_cols > cols:
-        value = torch.nn.functional.pad(value, (0, padded_cols - cols))
-
-    num_groups = padded_cols // 32
-    rows_g = rows * num_groups
-    value_g = value.reshape(rows_g, 32)
-    output_g = torch.zeros(rows_g, num_bits, dtype=torch.int32, device=device)
-
-    elem_i = torch.arange(32, device=device, dtype=torch.int32)
-    bit_starts = elem_i * num_bits
-    word_idx = (bit_starts // 32).long()
-    bit_offset = bit_starts % 32
-
-    output_g.scatter_add_(
-        1,
-        word_idx.unsqueeze(0).expand(rows_g, -1),
-        value_g << bit_offset.unsqueeze(0),
-    )
-
-    ov = bit_offset + num_bits - 32
-    ov_mask = ov > 0
-    if ov_mask.any():
-        ov_vals = value_g[:, ov_mask] >> (num_bits - ov[ov_mask]).unsqueeze(0)
-        output_g.scatter_add_(
-            1,
-            (word_idx[ov_mask] + 1).unsqueeze(0).expand(rows_g, -1),
-            ov_vals,
-        )
-
-    # Truncate to minimum number of int32 words needed
-    output = output_g.view(rows, num_groups * num_bits)[:, :packed_cols]
-
-    if packed_dim == 0:
-        output = output.transpose(0, 1)
-
-    return output
 
 
 def unpack_from_int32(

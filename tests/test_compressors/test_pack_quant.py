@@ -9,7 +9,6 @@ import torch
 from compressed_tensors import PackedQuantizationCompressor
 from compressed_tensors.compressors.pack_quantized.helpers import (
     pack_to_int32,
-    pack_to_int32_accelerated,
     unpack_from_int32,
 )
 from compressed_tensors.quantization import (
@@ -498,11 +497,11 @@ def test_triton_vs_pytorch_pack_dim1(num_bits, shape):
     lo, hi = -(1 << (num_bits - 1)), (1 << (num_bits - 1)) - 1
     value = torch.randint(lo, hi + 1, shape, dtype=torch.int8, device=device)
 
-    # PyTorch reference (pure CPU implementation)
+    # PyTorch path (CPU forces PyTorch fallback)
     packed_pytorch = pack_to_int32(value.cpu(), num_bits, packed_dim=1).to(device)
 
-    # Triton accelerated (should use row-parallel kernel on CUDA)
-    packed_triton = pack_to_int32_accelerated(value, num_bits, packed_dim=1)
+    # Triton path (CUDA uses Triton kernel)
+    packed_triton = pack_to_int32(value, num_bits, packed_dim=1)
 
     assert packed_triton.dtype == torch.int32
     assert packed_triton.shape == packed_pytorch.shape
@@ -546,11 +545,11 @@ def test_triton_vs_pytorch_pack_dim0(num_bits, shape):
     lo, hi = -(1 << (num_bits - 1)), (1 << (num_bits - 1)) - 1
     value = torch.randint(lo, hi + 1, shape, dtype=torch.int8, device=device)
 
-    # PyTorch reference (pure CPU implementation)
+    # PyTorch path (CPU forces PyTorch fallback)
     packed_pytorch = pack_to_int32(value.cpu(), num_bits, packed_dim=0).to(device)
 
-    # Triton accelerated (should use col-parallel kernel on CUDA)
-    packed_triton = pack_to_int32_accelerated(value, num_bits, packed_dim=0)
+    # Triton path (CUDA uses Triton kernel)
+    packed_triton = pack_to_int32(value, num_bits, packed_dim=0)
 
     assert packed_triton.dtype == torch.int32
     assert packed_triton.shape == packed_pytorch.shape
@@ -579,11 +578,11 @@ def test_triton_vs_pytorch_all_bit_widths(num_bits, packed_dim):
     lo, hi = -(1 << (num_bits - 1)), (1 << (num_bits - 1)) - 1
     value = torch.randint(lo, hi + 1, shape, dtype=torch.int8, device=device)
 
-    # PyTorch reference
+    # PyTorch path (CPU forces PyTorch fallback)
     packed_pytorch = pack_to_int32(value.cpu(), num_bits, packed_dim).to(device)
 
-    # Triton accelerated
-    packed_triton = pack_to_int32_accelerated(value, num_bits, packed_dim)
+    # Triton path (CUDA uses Triton kernel)
+    packed_triton = pack_to_int32(value, num_bits, packed_dim)
 
     assert torch.equal(
         packed_triton, packed_pytorch
@@ -603,11 +602,11 @@ def test_triton_vs_pytorch_3d_tensor(num_bits):
     value = torch.randint(lo, hi + 1, shape, dtype=torch.int8, device=device)
 
     for packed_dim in [0, 1]:
-        # PyTorch reference
+        # PyTorch path (CPU forces PyTorch fallback)
         packed_pytorch = pack_to_int32(value.cpu(), num_bits, packed_dim).to(device)
 
-        # Triton accelerated
-        packed_triton = pack_to_int32_accelerated(value, num_bits, packed_dim)
+        # Triton path (CUDA uses Triton kernel)
+        packed_triton = pack_to_int32(value, num_bits, packed_dim)
 
         assert torch.equal(packed_triton, packed_pytorch), (
             f"Triton vs PyTorch mismatch for 3D tensor, num_bits={num_bits}, "
@@ -617,16 +616,17 @@ def test_triton_vs_pytorch_3d_tensor(num_bits):
 
 @requires_gpu
 @requires_triton
-def test_triton_accelerated_on_cpu_fallback():
+def test_pack_to_int32_cpu_vs_gpu_match():
     """
-    Test that pack_to_int32_accelerated falls back to PyTorch on CPU tensors.
+    Test that pack_to_int32 on CPU produces same results as on GPU.
     """
     shape = (256, 512)
-    value = torch.randint(-8, 8, shape, dtype=torch.int8)  # CPU tensor
+    value = torch.randint(-8, 8, shape, dtype=torch.int8)
 
-    # Should work without error (falls back to PyTorch)
-    packed = pack_to_int32_accelerated(value, num_bits=4, packed_dim=1)
+    # CPU path (PyTorch fallback)
+    packed_cpu = pack_to_int32(value, num_bits=4, packed_dim=1)
 
-    # Verify correctness
-    packed_reference = pack_to_int32(value, num_bits=4, packed_dim=1)
-    assert torch.equal(packed, packed_reference)
+    # GPU path (Triton kernel)
+    packed_gpu = pack_to_int32(value.cuda(), num_bits=4, packed_dim=1).cpu()
+
+    assert torch.equal(packed_cpu, packed_gpu)

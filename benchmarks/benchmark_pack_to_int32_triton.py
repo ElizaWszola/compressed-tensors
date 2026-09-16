@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Benchmark script comparing pack_to_int32 Triton implementations.
+Benchmark script comparing pack_to_int32 PyTorch vs Triton paths.
 
 Compares:
-- pack_to_int32: Original PyTorch implementation (baseline)
-- pack_to_int32_accelerated: Triton-accelerated version
+- PyTorch baseline: Pure PyTorch scatter_add implementation on GPU
+- Triton: pack_to_int32 on GPU (uses Triton kernel)
 
 Tests both:
 - packed_dim=0: Uses col-parallel kernel (no transpose)
@@ -30,15 +30,70 @@ if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
 import gc
+import math
+
 import torch
 
-from compressed_tensors.compressors.pack_quantized.helpers import (
-    pack_to_int32,
-    pack_to_int32_accelerated,
-)
+from compressed_tensors.compressors.pack_quantized.helpers import pack_to_int32
 
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 N_RUNS = 100
+
+
+def _pack_to_int32_pytorch(value: torch.Tensor, num_bits: int, packed_dim: int = 1):
+    """
+    Pure PyTorch implementation of pack_to_int32 for benchmarking.
+
+    This bypasses ImplBackend dispatch to always use PyTorch scatter_add,
+    even on GPU, for fair comparison against Triton.
+    """
+    # Convert to unsigned range
+    offset = 1 << (num_bits - 1)
+    value = value.to(torch.int32) + offset
+
+    if packed_dim == 0:
+        value = value.transpose(0, 1)
+
+    rows, cols = value.shape
+    packed_cols = math.ceil(cols * num_bits / 32)
+
+    # Pad to multiple of 32
+    padded_cols = math.ceil(cols / 32) * 32
+    if padded_cols > cols:
+        value = torch.nn.functional.pad(value, (0, padded_cols - cols))
+
+    num_groups = padded_cols // 32
+    rows_g = rows * num_groups
+    value_g = value.reshape(rows_g, 32)
+    output_g = torch.zeros(rows_g, num_bits, dtype=torch.int32, device=value.device)
+
+    elem_i = torch.arange(32, device=value.device, dtype=torch.int32)
+    bit_starts = elem_i * num_bits
+    word_idx = (bit_starts // 32).long()
+    bit_offset = bit_starts % 32
+
+    output_g.scatter_add_(
+        1,
+        word_idx.unsqueeze(0).expand(rows_g, -1),
+        value_g << bit_offset.unsqueeze(0),
+    )
+
+    ov = bit_offset + num_bits - 32
+    ov_mask = ov > 0
+    if ov_mask.any():
+        ov_vals = value_g[:, ov_mask] >> (num_bits - ov[ov_mask]).unsqueeze(0)
+        output_g.scatter_add_(
+            1,
+            (word_idx[ov_mask] + 1).unsqueeze(0).expand(rows_g, -1),
+            ov_vals,
+        )
+
+    output = output_g.view(rows, num_groups * num_bits)[:, :packed_cols]
+
+    if packed_dim == 0:
+        output = output.transpose(0, 1)
+
+    return output
 
 
 # Real-world weight matrix shapes (rows, cols, description)
@@ -120,10 +175,10 @@ def benchmark_cuda(func, x, num_bits, packed_dim, name, warmup=False):
 
 
 def verify_correctness(x, num_bits, packed_dim):
-    """Verify that accelerated implementation matches PyTorch baseline."""
-    result_original = pack_to_int32(x.clone(), num_bits, packed_dim)
-    result_accel = pack_to_int32_accelerated(x.clone(), num_bits, packed_dim)
-    return torch.equal(result_original, result_accel)
+    """Verify that Triton implementation matches PyTorch baseline."""
+    result_pytorch = _pack_to_int32_pytorch(x.clone(), num_bits, packed_dim)
+    result_triton = pack_to_int32(x, num_bits, packed_dim)
+    return torch.equal(result_pytorch, result_triton)
 
 
 def run_benchmark_for_shape(rows, cols, num_bits, packed_dim, shape_name):
@@ -133,14 +188,14 @@ def run_benchmark_for_shape(rows, cols, num_bits, packed_dim, shape_name):
     # Verify correctness
     correct = verify_correctness(x, num_bits, packed_dim)
 
-    # Benchmark PyTorch baseline
+    # Benchmark PyTorch baseline on GPU
     avg_orig, _, _, _ = benchmark_cuda(
-        pack_to_int32, x, num_bits, packed_dim, "PyTorch", warmup=True
+        _pack_to_int32_pytorch, x, num_bits, packed_dim, "PyTorch", warmup=True
     )
 
-    # Benchmark Triton accelerated
+    # Benchmark Triton on GPU
     avg_accel, _, _, _ = benchmark_cuda(
-        pack_to_int32_accelerated, x, num_bits, packed_dim, "Triton", warmup=True
+        pack_to_int32, x, num_bits, packed_dim, "Triton", warmup=True
     )
 
     # Calculate speedup
