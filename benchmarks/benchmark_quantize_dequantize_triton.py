@@ -21,6 +21,7 @@ from compressed_tensors.quantization.lifecycle.forward_helpers import (
     _quantize_dequantize_triton,
     _quantize_triton,
     adapt_scale_and_zp_for_triton,
+    round_to_quantized_type_args,
 )
 from compressed_tensors.quantization.quant_args import (
     QuantizationArgs,
@@ -186,13 +187,39 @@ def mixed_triton_pytorch_quantize_dequantize(x, scale, zero_point, q_min, q_max,
     return pytorch_dequantize_cuda(x_q, scale, zero_point, args)
 
 
-def pytorch_quantize_dequantize(x, scale, zero_point, q_min, q_max, args):
-    """Pure PyTorch: quantize then dequantize (no Triton)."""
-    # Quantize with PyTorch
-    x_q = pytorch_quantize_cuda(x, scale, zero_point, q_min, q_max, args)
+def pytorch_quantize_dequantize_fused(x, scale, zero_point, q_min, q_max, args):
+    """
+    Fused PyTorch quantize-then-dequantize in a single pass, avoiding:
+    - Double scale/global_scale division
+    - Intermediate quantized dtype allocation
     
-    # Dequantize with PyTorch
-    return pytorch_dequantize_cuda(x_q, scale, zero_point, args)
+    This mirrors the implementation in forward_helpers._quantize_dequantize
+    """
+    # Ensure scale broadcasts correctly to x shape
+    scale_broadcast = scale
+    while scale_broadcast.ndim < x.ndim:
+        scale_broadcast = scale_broadcast.unsqueeze(-1)
+    
+    # Quantize: x / scale + zero_point
+    scaled = x / scale_broadcast
+
+    if zero_point is not None:
+        zp_broadcast = zero_point
+        while zp_broadcast.ndim < x.ndim:
+            zp_broadcast = zp_broadcast.unsqueeze(-1)
+        scaled = scaled + zp_broadcast.to(x.dtype)
+
+    # Clamp and round (stays in float — no int8/fp8 intermediate)
+    quantized = round_to_quantized_type_args(
+        tensor=scaled, args=args, min=q_min, max=q_max
+    )
+
+    # Dequantize: subtract zero_point and multiply by scale
+    dequant = quantized.to(scale_broadcast.dtype)
+    if zero_point is not None:
+        dequant = dequant - zp_broadcast.to(scale_broadcast.dtype)
+
+    return dequant * scale_broadcast
 
 
 def benchmark_cuda(func, x, scale, zero_point, q_min, q_max, args, name, warmup=False):
@@ -268,15 +295,15 @@ def run_config(quant_type, num_bits, rows, cols, strategy=QuantizationStrategy.T
         rows, cols, quant_type, num_bits, device, strategy, group_size
     )
 
-    # 1. Pure PyTorch (both quantize + dequantize)
-    print("\nRunning PyTorch quantize + PyTorch dequantize...")
-    time_pytorch = benchmark_cuda(
-        pytorch_quantize_dequantize,
+    # 1. PyTorch fused (single pass) - baseline
+    print("\nRunning PyTorch fused quantize+dequantize (baseline)...")
+    time_pytorch_fused = benchmark_cuda(
+        pytorch_quantize_dequantize_fused,
         x_cuda, scale_cuda, zp_cuda, q_min_cuda, q_max_cuda, args,
-        "pytorch_q+d", warmup=True
+        "pytorch_fused", warmup=True
     )
-    print("PyTorch Q+D:")
-    print(f"  Time: {time_pytorch*1000:.2f}ms")
+    print("PyTorch Fused Q+D:")
+    print(f"  Time: {time_pytorch_fused*1000:.2f}ms")
 
     # 2. Mixed Triton quantize + PyTorch dequantize
     print("\nRunning Triton quantize + PyTorch dequantize...")
@@ -290,23 +317,23 @@ def run_config(quant_type, num_bits, rows, cols, strategy=QuantizationStrategy.T
 
     # 3. Unfused Triton (both quantize + dequantize)
     print("\nRunning Triton quantize + Triton dequantize...")
-    time_unfused = benchmark_cuda(
+    time_triton_unfused = benchmark_cuda(
         unfused_triton_quantize_dequantize, 
         x_cuda, scale_cuda, zp_cuda, q_min_cuda, q_max_cuda, args, 
-        "triton_q+d", warmup=True
+        "triton_unfused", warmup=True
     )
     print("Triton Q+D (unfused):")
-    print(f"  Time: {time_unfused*1000:.2f}ms")
+    print(f"  Time: {time_triton_unfused*1000:.2f}ms")
 
     # 4. Fused Triton (single kernel: quantize+dequantize)
     print("\nRunning Fused Triton (single kernel)...")
-    time_fused = benchmark_cuda(
+    time_triton_fused = benchmark_cuda(
         fused_triton_quantize_dequantize,
         x_cuda, scale_cuda, zp_cuda, q_min_cuda, q_max_cuda, args,
         "triton_fused", warmup=True
     )
     print("Triton Fused:")
-    print(f"  Time: {time_fused*1000:.2f}ms")
+    print(f"  Time: {time_triton_fused*1000:.2f}ms")
 
     # Verify correctness
     print("\nVerifying correctness...")
@@ -314,55 +341,56 @@ def run_config(quant_type, num_bits, rows, cols, strategy=QuantizationStrategy.T
         512, 1024, quant_type, num_bits, device, strategy, group_size
     )
     
-    pytorch_out = pytorch_quantize_dequantize(
+    # Use PyTorch fused as reference
+    pytorch_fused_out = pytorch_quantize_dequantize_fused(
         x_test.clone(), scale_test, zp_test, q_min_test, q_max_test, args_test
     )
     mixed_out = mixed_triton_pytorch_quantize_dequantize(
         x_test.clone(), scale_test, zp_test, q_min_test, q_max_test, args_test
     )
-    unfused_out = unfused_triton_quantize_dequantize(
+    triton_unfused_out = unfused_triton_quantize_dequantize(
         x_test.clone(), scale_test, zp_test, q_min_test, q_max_test, args_test
     )
-    fused_out = fused_triton_quantize_dequantize(
+    triton_fused_out = fused_triton_quantize_dequantize(
         x_test.clone(), scale_test, zp_test, q_min_test, q_max_test, args_test
     )
 
     atol = 1e-5
     rtol = 1e-5
     
-    # Check all against PyTorch reference
-    mixed_correct = torch.allclose(mixed_out, pytorch_out, atol=atol, rtol=rtol)
-    unfused_correct = torch.allclose(unfused_out, pytorch_out, atol=atol, rtol=rtol)
-    fused_correct = torch.allclose(fused_out, pytorch_out, atol=atol, rtol=rtol)
+    # Check all against PyTorch fused reference
+    mixed_correct = torch.allclose(mixed_out, pytorch_fused_out, atol=atol, rtol=rtol)
+    triton_unfused_correct = torch.allclose(triton_unfused_out, pytorch_fused_out, atol=atol, rtol=rtol)
+    triton_fused_correct = torch.allclose(triton_fused_out, pytorch_fused_out, atol=atol, rtol=rtol)
     
-    all_correct = mixed_correct and unfused_correct and fused_correct
+    all_correct = mixed_correct and triton_unfused_correct and triton_fused_correct
     
     if all_correct:
-        print("  ✓ All results match PyTorch reference")
+        print("  ✓ All results match PyTorch fused reference")
     else:
         print("  ✗ Some results differ:")
         if not mixed_correct:
-            diff = (mixed_out - pytorch_out).abs()
-            print(f"    Mixed vs PyTorch max_diff={diff.max().item():.6e}")
-        if not unfused_correct:
-            diff = (unfused_out - pytorch_out).abs()
-            print(f"    Unfused vs PyTorch max_diff={diff.max().item():.6e}")
-        if not fused_correct:
-            diff = (fused_out - pytorch_out).abs()
-            print(f"    Fused vs PyTorch max_diff={diff.max().item():.6e}")
+            diff = (mixed_out - pytorch_fused_out).abs()
+            print(f"    Mixed vs PyTorch Fused max_diff={diff.max().item():.6e}")
+        if not triton_unfused_correct:
+            diff = (triton_unfused_out - pytorch_fused_out).abs()
+            print(f"    Triton Unfused vs PyTorch Fused max_diff={diff.max().item():.6e}")
+        if not triton_fused_correct:
+            diff = (triton_fused_out - pytorch_fused_out).abs()
+            print(f"    Triton Fused vs PyTorch Fused max_diff={diff.max().item():.6e}")
 
-    # Calculate speedups vs PyTorch baseline
-    speedup_mixed = time_pytorch / time_mixed if time_mixed > 0 else 0
-    speedup_unfused = time_pytorch / time_unfused if time_unfused > 0 else 0
-    speedup_fused = time_pytorch / time_fused if time_fused > 0 else 0
+    # Calculate speedups vs PyTorch fused baseline
+    speedup_mixed = time_pytorch_fused / time_mixed if time_mixed > 0 else 0
+    speedup_triton_unfused = time_pytorch_fused / time_triton_unfused if time_triton_unfused > 0 else 0
+    speedup_triton_fused = time_pytorch_fused / time_triton_fused if time_triton_fused > 0 else 0
     
-    print(f"\nSpeedup vs PyTorch baseline:")
+    print(f"\nSpeedup vs PyTorch Fused baseline:")
     print(f"  Mixed (Triton Q + PyTorch D): {speedup_mixed:.2f}x")
-    print(f"  Triton Unfused: {speedup_unfused:.2f}x")
-    print(f"  Triton Fused: {speedup_fused:.2f}x")
+    print(f"  Triton Unfused: {speedup_triton_unfused:.2f}x")
+    print(f"  Triton Fused: {speedup_triton_fused:.2f}x")
 
     del x_cuda, scale_cuda, x_test, scale_test
-    del pytorch_out, mixed_out, unfused_out, fused_out
+    del pytorch_fused_out, mixed_out, triton_unfused_out, triton_fused_out
     torch.cuda.empty_cache()
     gc.collect()
 
@@ -372,13 +400,13 @@ def run_config(quant_type, num_bits, rows, cols, strategy=QuantizationStrategy.T
         "cols": cols,
         "strategy": strategy.value if hasattr(strategy, 'value') else str(strategy),
         "group_size": group_size,
-        "pytorch_ms": time_pytorch * 1000,
+        "pytorch_fused_ms": time_pytorch_fused * 1000,
         "mixed_ms": time_mixed * 1000,
-        "unfused_ms": time_unfused * 1000,
-        "fused_ms": time_fused * 1000,
+        "triton_unfused_ms": time_triton_unfused * 1000,
+        "triton_fused_ms": time_triton_fused * 1000,
         "speedup_mixed": speedup_mixed,
-        "speedup_unfused": speedup_unfused,
-        "speedup_fused": speedup_fused,
+        "speedup_triton_unfused": speedup_triton_unfused,
+        "speedup_triton_fused": speedup_triton_fused,
         "correct": all_correct,
     }
 
@@ -395,7 +423,7 @@ def main():
         return
 
     print("Benchmarking quantize+dequantize implementations:")
-    print("  1. PyTorch Q + PyTorch D (baseline)")
+    print("  1. PyTorch Fused Q+D (single pass, baseline)")
     print("  2. Triton Q + PyTorch D (mixed)")
     print("  3. Triton Q + Triton D (unfused)")
     print("  4. Triton Fused Q+D (single kernel)")
@@ -459,32 +487,32 @@ def main():
             results.append(result)
 
     # Print summary
-    print("\n" + "=" * 145)
-    print("SUMMARY - All times in ms, speedups relative to PyTorch baseline")
-    print("=" * 145)
+    print("\n" + "=" * 140)
+    print("SUMMARY - All times in ms, speedups relative to PyTorch Fused baseline")
+    print("=" * 140)
     print(
-        f"{'Config':<20} {'Size':<12} {'PyTorch':<10} {'Mixed':<10} {'T Unfused':<10} "
-        f"{'T Fused':<10} {'Mix SpUp':<9} {'Unf SpUp':<9} {'Fused SpUp':<11} {'OK':<4}"
+        f"{'Config':<20} {'Size':<12} {'PT Fused':<10} {'Mixed':<10} "
+        f"{'T Unfused':<10} {'T Fused':<10} {'Mix SpUp':<9} {'TU SpUp':<9} {'TF SpUp':<9} {'OK':<4}"
     )
-    print("-" * 145)
+    print("-" * 140)
 
     for r in results:
         size_str = f"{r['rows']}x{r['cols']}"
         correct_str = "Yes" if r["correct"] else "NO"
         print(
             f"{r['config']:<20} {size_str:<12} "
-            f"{r['pytorch_ms']:>7.2f} ms {r['mixed_ms']:>7.2f} ms "
-            f"{r['unfused_ms']:>7.2f} ms {r['fused_ms']:>7.2f} ms "
-            f"{r['speedup_mixed']:>6.2f}x  {r['speedup_unfused']:>6.2f}x  "
-            f"{r['speedup_fused']:>6.2f}x      {correct_str:<4}"
+            f"{r['pytorch_fused_ms']:>7.2f} ms "
+            f"{r['mixed_ms']:>7.2f} ms {r['triton_unfused_ms']:>7.2f} ms {r['triton_fused_ms']:>7.2f} ms "
+            f"{r['speedup_mixed']:>6.2f}x  "
+            f"{r['speedup_triton_unfused']:>6.2f}x  {r['speedup_triton_fused']:>6.2f}x  {correct_str:<4}"
         )
 
     # Print mode descriptions
-    print("\n" + "=" * 145)
+    print("\n" + "=" * 140)
     print("BENCHMARKED MODES")
-    print("=" * 145)
+    print("=" * 140)
     print()
-    print("  PyTorch:    PyTorch quantize + PyTorch dequantize (native PyTorch ops, baseline)")
+    print("  PT Fused:   PyTorch fused quantize+dequantize (single pass, baseline)")
     print("  Mixed:      Triton quantize + PyTorch dequantize")
     print("  T Unfused:  Triton quantize + Triton dequantize (two separate kernels)")
     print("  T Fused:    Triton quantize+dequantize (single fused kernel)")
