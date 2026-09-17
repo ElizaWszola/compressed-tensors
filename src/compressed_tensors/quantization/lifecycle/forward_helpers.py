@@ -330,13 +330,20 @@ def _quantize_dequantize_triton(
     global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Triton implementation of fused quantize-then-dequantize."""
-    num_rows = x.shape[0]
-    scale, zero_point = adapt_scale_and_zp_for_triton(scale, zero_point, num_rows)
-
     original_shape = x.shape
 
+    # For TENSOR/CHANNEL strategies, flatten to 2D if needed
+    if args.strategy in (QuantizationStrategy.TENSOR, QuantizationStrategy.CHANNEL):
+        if x.ndim > 2:
+            x = x.flatten(end_dim=-2)  # Flatten all dims except last to get 2D
+
+    num_rows = x.shape[0]
+    scale, zero_point = adapt_scale_and_zp_for_triton(
+        scale, zero_point, num_rows, args.strategy
+    )
+
     quant_type = (
-        QUANT_TYPE_INT if args.type == QuantizationType.INT.value else QUANT_TYPE_FLOAT
+        QUANT_TYPE_INT if args.type == QuantizationType.INT else QUANT_TYPE_FLOAT
     )
     num_bits = args.num_bits
 
@@ -353,7 +360,13 @@ def _quantize_dequantize_triton(
         dim_1, dim_2, dim_3 = x.shape
         group_size = dim_3
         num_scale_cols = dim_2  # num_groups
+    elif args.strategy == QuantizationStrategy.TOKEN:
+        dim_0, dim_1, dim_3 = x.shape
+        dim_2 = 1
+        group_size = dim_3  # all cols share same scale
+        num_scale_cols = 1  # one scale per token
     elif args.strategy in (QuantizationStrategy.TENSOR, QuantizationStrategy.CHANNEL):
+        # x is guaranteed to be 2D here (flattened above if needed)
         dim_0 = 1
         dim_1, dim_3 = x.shape
         dim_2 = 1
@@ -394,6 +407,11 @@ def _quantize_dequantize_triton(
         input_stride_1, input_stride_2, input_stride_3 = x_strides
         output_stride_0 = 0
         output_stride_1, output_stride_2, output_stride_3 = out_strides
+    elif args.strategy == QuantizationStrategy.TOKEN:
+        input_stride_0, input_stride_1, input_stride_3 = x_strides
+        input_stride_2 = 0
+        output_stride_0, output_stride_1, output_stride_3 = out_strides
+        output_stride_2 = 0
     else:
         input_stride_0 = 0
         input_stride_1, input_stride_3 = x_strides
@@ -449,26 +467,31 @@ def _quantize_dequantize(
     global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
-    Unfused quantize-dequantize operation.
+    Fused quantize-then-dequantize in a single pass, avoiding:
+    - Double scale/global_scale division
+    - Intermediate quantized dtype allocation
     """
-    quantized = _quantize(
-        x,
-        scale,
-        zero_point=zero_point,
-        q_min=q_min,
-        q_max=q_max,
-        args=args,
-        dtype=None,  # Keep in float for dequantize
-        global_scale=global_scale,
+    # compute effective scale once
+    if global_scale is not None:
+        scale = scale / global_scale
+
+    scaled = x / scale
+
+    if zero_point is not None:
+        scaled += zero_point.to(x.dtype)
+
+    # clamp and round (stays in float — no int8/fp8 intermediate)
+    quantized = round_to_quantized_type_args(
+        tensor=scaled, args=args, min=q_min, max=q_max
     )
-    return _dequantize(
-        quantized,
-        scale,
-        zero_point=zero_point,
-        dtype=x.dtype,
-        global_scale=global_scale,
-        args=args,
-    )
+
+    # dequantize: subtract zero_point and multiply by scale
+    # cast to scale.dtype to match _dequantize behavior
+    dequant = quantized.to(scale.dtype)
+    if zero_point is not None:
+        dequant = dequant - zero_point.to(scale.dtype)
+
+    return dequant * scale
 
 
 @triton.jit
@@ -703,7 +726,7 @@ def adapt_scale_and_zp_for_triton(
     (one value per row/group), so contiguous() is cheap
     """
     match strategy:
-        case QuantizationStrategy.CHANNEL:
+        case QuantizationStrategy.CHANNEL:  # | QuantizationStrategy.TOKEN:
             scale = scale.unflatten(0, (num_rows, -1))
             if zero_point is not None:
                 zero_point = zero_point.unflatten(0, (num_rows, -1))
@@ -754,6 +777,11 @@ def _quantize_triton(
         dim_1, dim_2, dim_3 = x.shape
         group_size = dim_3
         num_scale_cols = dim_2  # num_groups
+    elif args.strategy == QuantizationStrategy.TOKEN:
+        dim_0, dim_1, dim_3 = x.shape
+        dim_2 = 1
+        group_size = dim_3  # all cols share same scale
+        num_scale_cols = 1  # one scale per token
     elif args.strategy in (QuantizationStrategy.TENSOR, QuantizationStrategy.CHANNEL):
         dim_0 = 1
         dim_1, dim_3 = x.shape
@@ -795,6 +823,11 @@ def _quantize_triton(
         input_stride_1, input_stride_2, input_stride_3 = x_strides
         output_stride_0 = 0
         output_stride_1, output_stride_2, output_stride_3 = out_strides
+    elif args.strategy == QuantizationStrategy.TOKEN:
+        input_stride_0, input_stride_1, input_stride_3 = x_strides
+        input_stride_2 = 0
+        output_stride_0, output_stride_1, output_stride_3 = out_strides
+        output_stride_2 = 0
     else:
         input_stride_0 = 0
         input_stride_1, input_stride_3 = x_strides
@@ -888,7 +921,10 @@ def _dequantize_triton(
 
     # Adapt scale and zero_point for Triton kernel
     num_rows = x_q.shape[0]
-    scale, zero_point = adapt_scale_and_zp_for_triton(scale, zero_point, num_rows)
+    strategy = args.strategy if args is not None else None
+    scale, zero_point = adapt_scale_and_zp_for_triton(
+        scale, zero_point, num_rows, strategy
+    )
 
     # Determine dimensions based on strategy (mirroring _quantize logic)
     if args is not None and args.strategy == QuantizationStrategy.BLOCK:
@@ -903,6 +939,11 @@ def _dequantize_triton(
         dim_1, dim_2, dim_3 = x_q.shape
         group_size = dim_3
         num_scale_cols = dim_2  # num_groups
+    elif args is not None and args.strategy == QuantizationStrategy.TOKEN:
+        dim_0, dim_1, dim_3 = x_q.shape
+        dim_2 = 1
+        group_size = dim_3  # all cols share same scale
+        num_scale_cols = 1  # one scale per token
     elif args is not None and args.strategy in (
         QuantizationStrategy.TENSOR,
         QuantizationStrategy.CHANNEL,
@@ -965,6 +1006,11 @@ def _dequantize_triton(
         input_stride_1, input_stride_2, input_stride_3 = x_strides
         output_stride_0 = 0
         output_stride_1, output_stride_2, output_stride_3 = out_strides
+    elif args is not None and args.strategy == QuantizationStrategy.TOKEN:
+        input_stride_0, input_stride_1, input_stride_3 = x_strides
+        input_stride_2 = 0
+        output_stride_0, output_stride_1, output_stride_3 = out_strides
+        output_stride_2 = 0
     elif args is not None and args.strategy in (
         QuantizationStrategy.TENSOR,
         QuantizationStrategy.CHANNEL,

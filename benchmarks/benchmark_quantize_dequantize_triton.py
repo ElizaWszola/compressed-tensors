@@ -67,7 +67,9 @@ def create_test_data(rows, cols, quant_type, num_bits, target_device, strategy=Q
 def fused_triton_quantize_dequantize(x, scale, zero_point, q_min, q_max, args):
     """Fused Triton quantize+dequantize (single kernel)."""
     num_rows = x.shape[0]
-    scale_adapted, zp_adapted = adapt_scale_and_zp_for_triton(scale, zero_point, num_rows)
+    scale_adapted, zp_adapted = adapt_scale_and_zp_for_triton(
+        scale, zero_point, num_rows, args.strategy
+    )
     return _quantize_dequantize_triton(
         x,
         scale_adapted,
@@ -140,7 +142,9 @@ def pytorch_dequantize_cuda(x_q, scale, zero_point, args):
 def unfused_triton_quantize_dequantize(x, scale, zero_point, q_min, q_max, args):
     """Unfused Triton: quantize then dequantize (two kernels)."""
     num_rows = x.shape[0]
-    scale_adapted, zp_adapted = adapt_scale_and_zp_for_triton(scale, zero_point, num_rows)
+    scale_adapted, zp_adapted = adapt_scale_and_zp_for_triton(
+        scale, zero_point, num_rows, args.strategy
+    )
     
     # Quantize with Triton
     x_q = _quantize_triton(
@@ -164,7 +168,9 @@ def unfused_triton_quantize_dequantize(x, scale, zero_point, q_min, q_max, args)
 def mixed_triton_pytorch_quantize_dequantize(x, scale, zero_point, q_min, q_max, args):
     """Mixed: Triton quantize + PyTorch dequantize."""
     num_rows = x.shape[0]
-    scale_adapted, zp_adapted = adapt_scale_and_zp_for_triton(scale, zero_point, num_rows)
+    scale_adapted, zp_adapted = adapt_scale_and_zp_for_triton(
+        scale, zero_point, num_rows, args.strategy
+    )
     
     # Quantize with Triton
     x_q = _quantize_triton(

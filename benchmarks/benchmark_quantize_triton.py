@@ -57,7 +57,9 @@ def pytorch_quantize_cuda(x, scale, zero_point, q_min, q_max, args):
 def triton_quantize_cuda(x, scale, zero_point, q_min, q_max, args):
     """Triton kernel wrapper that adapts scale/zp and enables Triton."""
     num_rows = x.shape[0]
-    scale_adapted, zp_adapted = adapt_scale_and_zp_for_triton(scale, zero_point, num_rows)
+    scale_adapted, zp_adapted = adapt_scale_and_zp_for_triton(
+        scale, zero_point, num_rows, args.strategy
+    )
     return _quantize(
         x,
         scale_adapted,
