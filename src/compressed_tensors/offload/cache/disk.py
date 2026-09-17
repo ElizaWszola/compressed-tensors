@@ -113,7 +113,9 @@ class DiskCache(OffloadCache):
         }
 
         assert self._is_ct_file_path(file_path), f"Attempted to write to {file_path}"
-        save_file({"weight": tensor}, file_path)
+        # safetensors requires contiguous tensors; compressed/packed weights (e.g.
+        # NVFP4, FP8 block) may be non-contiguous views after compression.
+        save_file({"weight": tensor.contiguous()}, file_path)
         return offloaded
 
     def __delitem__(self, key: str):
@@ -178,8 +180,7 @@ class DiskCache(OffloadCache):
             logger.bind(log_once=True).warning(
                 f"Dtype mismatch during create_checkpoint_symlink: offloaded meta "
                 f"tensor dtype {offloaded.dtype} does not match weight_info dtype "
-                f"{weight_info_dtype}. Please upgrade transformers to include "
-                "transformers#46849"
+                f"{weight_info_dtype}."
             )
 
         # Resolve relative paths to absolute paths for symlink creation
